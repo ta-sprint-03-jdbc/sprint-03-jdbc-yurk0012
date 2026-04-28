@@ -1,0 +1,168 @@
+name: AI Code Review
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get Changed Files
+        id: changed-files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" == "pull_request" ]; then
+            FILES=$(git diff --name-only origin/main...HEAD | grep 'ChildDBTest\.java$' | xargs || true)
+          else
+            FILES=$(git diff --name-only HEAD~1 HEAD | grep 'ChildDBTest\.java$' | xargs || true)
+          fi
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+
+      - name: Claude AI Review
+        if: steps.changed-files.outputs.files != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_FILES: ${{ steps.changed-files.outputs.files }}
+        run: |
+          CONTEXT=""
+          for file in $PR_FILES; do
+            if [ -f "$file" ]; then
+              CONTENT=$(cat "$file")
+              CONTEXT="$CONTEXT\n\n--- FILE: $file ---\n$CONTENT"
+            fi
+          done
+
+          PROMPT="You are a senior Java developer reviewing a student's JDBC assignment.
+
+          TASK DESCRIPTION:
+          The student had to implement JUnit 5 tests for the ChildDB class — a JDBC-based DAO for managing Child entities in a PostgreSQL database.
+
+          The Child entity has: id (Long), firstName (String), lastName (String), birthDate (LocalDate), clubs (List<Club>).
+
+          Requirements for ChildDBTest:
+          1. Test all ChildDAO methods: create, findById, findAll, update, delete (and any additional methods defined in ChildDAO).
+          2. Use a real PostgreSQL database — no mocking.
+          3. Use @BeforeEach / @AfterEach (or @BeforeAll / @AfterAll) for setup and cleanup so each test is independent.
+          4. Each test must be self-contained and not rely on the state left by other tests.
+          5. Assertions must be meaningful: verify actual field values, not just that the result is non-null.
+          6. Use try-with-resources or proper resource cleanup in the DAO (not in tests).
+
+          REVIEW only the ChildDBTest implementation and provide feedback in this structure:
+
+          ✅ WHAT IS DONE WELL:
+          - List specific things the student implemented correctly
+          - Mention good practices they followed
+
+          ⚠️ WHAT CAN BE IMPROVED:
+          - List concrete issues or missed requirements
+          - For each issue, provide a short example of how to fix it, like:
+
+            Instead of:
+            \`\`\`java
+            assertNotNull(child);
+            \`\`\`
+            Do this:
+            \`\`\`java
+            assertEquals("John", child.getFirstName());
+            assertEquals("Doe", child.getLastName());
+            \`\`\`
+
+          Keep feedback constructive, specific, and beginner-friendly.
+
+          Student's code:
+          $CONTEXT"
+
+          ✅ WHAT IS DONE WELL:
+          - List specific things the student implemented correctly
+          - Mention good practices they followed
+
+          ⚠️ WHAT CAN BE IMPROVED:
+          - List concrete issues or missed requirements
+          - For each issue, provide a short example of how to fix it, like:
+
+            Instead of:
+            \`\`\`java
+            Statement stmt = conn.createStatement();
+            stmt.execute(\"SELECT * FROM category WHERE id = \" + id);
+            \`\`\`
+            Do this:
+            \`\`\`java
+            PreparedStatement stmt = conn.prepareStatement(\"SELECT * FROM category WHERE id = ?\");
+            stmt.setLong(1, id);
+            \`\`\`
+
+          Keep feedback constructive, specific, and beginner-friendly.
+
+          Student's code:
+          $CONTEXT"
+
+          ESCAPED_PROMPT=$(echo "$PROMPT" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()))')
+
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"claude-haiku-4-5-20251001\",
+              \"max_tokens\": 1024,
+              \"messages\": [{\"role\": \"user\", \"content\": $ESCAPED_PROMPT}]
+            }")
+
+          REVIEW_COMMENT=$(echo "$RESPONSE" | python3 -c '
+          import json, sys
+          res = json.load(sys.stdin)
+          if "content" in res and len(res["content"]) > 0 and "text" in res["content"][0]:
+              print(res["content"][0]["text"])
+          else:
+              print("Error: " + json.dumps(res))
+          ')
+
+          echo "$REVIEW_COMMENT" > review.txt
+
+      - name: Post Comment
+        if: success() && steps.changed-files.outputs.files != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('review.txt', 'utf8');
+            const body = "### 🤖 Claude AI Code Review\n\n" + comment;
+
+            if (context.eventName === 'pull_request') {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            } else {
+              await github.rest.repos.createCommitComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: context.sha,
+                body: body
+              });
+            }
+
+  copilot-review:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: GitHub Copilot Code Review
+        uses: github/copilot-code-review@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
